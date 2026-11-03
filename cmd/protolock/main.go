@@ -91,10 +91,20 @@ func main() {
 		}
 
 	case "commit":
-		// if force option is false (default), then disallow commit if
-		// there are any warnings encountered by runing a status check.
+		// if force option is false (default), then disallow commit unless
+		// the exact same status gate used by the `status` command passes:
+		// all built-in rules and every plugin succeed with no conflicts.
 		if !*force {
-			status(cfg)
+			code, err := runStatus(cfg)
+			if err != nil {
+				fmt.Println(logPrefix, "error:", err)
+			}
+			if code != 0 || err != nil {
+				if code != 0 {
+					os.Exit(code)
+				}
+				os.Exit(1)
+			}
 		}
 
 		r, err := protolock.Commit(*cfg)
@@ -110,48 +120,61 @@ func main() {
 		}
 
 	case "status":
-		status(cfg)
+		code, err := runStatus(cfg)
+		if err != nil {
+			fmt.Println(logPrefix, "error:", err)
+		}
+		if code != 0 {
+			os.Exit(code)
+		}
+		if err != nil {
+			os.Exit(1)
+		}
 
 	default:
 		os.Exit(0)
 	}
 }
 
-func status(cfg *protolock.Config) {
+// runStatus is the single pass/fail gate shared by the `status` command and a
+// non-forced `commit`. It only returns code 0 with a nil error when every
+// built-in rule and every specified plugin completes successfully with no
+// conflicts. Plugin failures and warnings are reported together: warnings
+// (built-in and from plugins that succeeded) are written first, so they are
+// not lost when another plugin fails.
+func runStatus(cfg *protolock.Config) (int, error) {
 	report, err := protolock.Status(*cfg)
 	if err == protolock.ErrOutOfDate {
 		fmt.Println(logPrefix, "error:", err, "run 'protolock commit'")
 		// only exit if flag provided for backwards compatibility
 		if cfg.UpToDate {
-			os.Exit(2)
+			return 2, nil
 		}
 		// don't report the error twice
 		err = nil
 	}
 	if err != protolock.ErrWarningsFound && err != nil {
-		fmt.Println(logPrefix, "error:", err)
-		os.Exit(1)
+		return 1, err
 	}
-	// if plugins are provided, attempt to execute each as a executable
+
+	// if plugins are provided, attempt to execute each as an executable
 	// located in the user's OS executable path as reported by stdlib's
-	// exec.LookPath func
+	// exec.LookPath func, or as a ".wasm" Extism plugin at the given path.
+	// runPlugins appends every plugin's warnings and returns an error if any
+	// plugin could not be run, timed out, produced unusable output, or
+	// reported its own error.
 	if *plugins != "" {
 		report, err = runPlugins(*plugins, report, *debug)
-		if err != nil {
-			fmt.Println(logPrefix, "error:", err)
-			os.Exit(1)
-		}
 	}
 
+	// write all conflicts (built-in and plugin) before returning, so they
+	// remain visible even when a plugin error is also returned
 	code, err := protolock.HandleReport(report, os.Stdout, err)
 	if err != protolock.ErrWarningsFound && err != nil {
-		fmt.Println(logPrefix, "error:", err)
-		os.Exit(1)
+		return code, err
 	}
 
-	if code != 0 {
-		os.Exit(code)
-	}
+	return code, nil
 }
 
 func saveToLockFile(cfg protolock.Config, r io.Reader) error {

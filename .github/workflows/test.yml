@@ -27,13 +27,28 @@ jobs:
           go test -v -race ./...
       - name:  install binary, test commands
         run: |
+          set +o pipefail
+
           go install ./...
           protolock
           stat proto.lock
           cat proto.lock | grep "testdata:/:test.proto"
           protolock status
           protolock commit
-          protolock status --plugins=_not-a-plugin_ | grep "executable file not found"
+
+          # a missing plugin must be visible in output AND fail with a
+          # non-zero exit code (failures must never be swallowed)
+          protolock status --plugins=_not-a-plugin_ 2>&1 | grep "executable file not found"
+          if protolock status --plugins=_not-a-plugin_ >/dev/null 2>&1; then
+            echo "expected missing plugin to fail status"
+            exit 1
+          fi
+
+          # a non-forced commit uses the same gate and must be blocked too
+          if protolock commit --plugins=_not-a-plugin_ >/dev/null 2>&1; then
+            echo "expected missing plugin to fail commit"
+            exit 1
+          fi
       - name: check output using plugin-sample-error
         run: |
           set +o pipefail
@@ -63,12 +78,27 @@ jobs:
         run: |
           set +o pipefail
 
-          ERRS=$(protolock status --plugins=plugin-sample-error,plugin-sample-error | grep "some error" | wc -l)
-          if [ "$ERRS" != 4 ]; then # (4 = 2 * 2, since errors are now reported using 2 lines)
+          ERRS=$(protolock status --plugins=plugin-sample-error,plugin-sample-error 2>&1 | grep "some error" | wc -l)
+          if [ "$ERRS" != 2 ]; then # one error line per failed plugin, none swallowed
             exit 1
           fi
-          MOREERRS=$(protolock status --plugins=plugin-sample-error,plugin-sample-error,plugin-sample-error | grep "some error" | wc -l)
-          if [ "$MOREERRS" != 6 ]; then # (6 = 3 * 2, since errors are now reported using 2 lines)
+          MOREERRS=$(protolock status --plugins=plugin-sample-error,plugin-sample-error,plugin-sample-error 2>&1 | grep "some error" | wc -l)
+          if [ "$MOREERRS" != 3 ]; then
+            exit 1
+          fi
+
+          # failures and warnings are reported together: the healthy plugin's
+          # warnings must still be present when another plugin fails
+          protolock status --plugins=plugin-sample,plugin-sample-error 2>&1 | grep "A sample warning!"
+          protolock status --plugins=plugin-sample-error,plugin-sample 2>&1 | grep "A sample warning!"
+
+          # unparseable plugin output and missing wasm files are failures too
+          printf '#!/bin/sh\nprintf "%%s" "not-json"\n' > "$PWD/pp-bad-output"
+          chmod +x "$PWD/pp-bad-output"
+          if protolock status --plugins="$PWD/pp-bad-output" >/dev/null 2>&1; then
+            exit 1
+          fi
+          if protolock status --plugins="$PWD/does-not-exist.wasm" >/dev/null 2>&1; then
             exit 1
           fi
       - name: remove a test proto file, expect violations.txt to contain data from plugin-sample
